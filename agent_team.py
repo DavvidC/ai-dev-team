@@ -1,16 +1,24 @@
 """
 agent_team.py
 =============
-Four-agent loop that works on the customer-health dashboard.
+Four-agent loop that works on any codebase.
 
   Product Owner → Developer → Reviewer → QA → Product Owner
   └──────────────── repeat until approved or MAX_ITERS ──────┘
 
 Usage:
-    pip install anthropic
     export ANTHROPIC_API_KEY=sk-ant-...
-    python agent_team.py "Add a filter by health status to the customer list"
-    python agent_team.py          # PO picks the next best task itself
+    export APP_DIR=/path/to/your/project
+
+    # Give the team a task:
+    /opt/homebrew/bin/python3.11 agent_team.py "Add a /health endpoint"
+
+    # Let the PO choose what to work on next:
+    /opt/homebrew/bin/python3.11 agent_team.py
+
+    # Tell QA exactly how to start the app (optional — PO will figure it out otherwise):
+    export START_CMD="npm run dev"
+    /opt/homebrew/bin/python3.11 agent_team.py "Add dark mode toggle"
 
 Safety: agents run shell commands scoped to APP_DIR only.
 """
@@ -28,11 +36,8 @@ import anthropic
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-APP_DIR = Path(os.environ.get(
-    "APP_DIR",
-    Path(__file__).parent / "customer-health-dashboard"
-)).resolve()
-
+APP_DIR   = Path(os.environ.get("APP_DIR", Path(__file__).parent)).resolve()
+START_CMD = os.environ.get("START_CMD", "")   # e.g. "npm run dev", "uvicorn app:app --port 8001"
 MAX_ITERS = int(os.environ.get("MAX_ITERS", "3"))
 
 OPUS   = "claude-opus-4-7"
@@ -162,31 +167,33 @@ def run_agent(role: str, model: str, system: str, user_message: str) -> str:
 # ---------------------------------------------------------------------------
 # Agent system prompts
 # ---------------------------------------------------------------------------
-_BACKEND  = f"{APP_DIR}/backend"
-_FRONTEND = f"{APP_DIR}/frontend"
+_start_cmd_hint = (
+    f"The command to start the app for testing is: {START_CMD}"
+    if START_CMD else
+    "Inspect the project to figure out how to start it (check package.json, "
+    "Makefile, requirements.txt, Procfile, README, etc.) and include the start "
+    "command in the spec so Developer and QA know what to use. Use port 8001 to "
+    "avoid conflicts with the production server."
+)
 
 PO_SYSTEM = f"""\
-You are the Product Owner for a FastAPI + static-HTML customer-health dashboard.
-
-App layout:
-  {_BACKEND}/app.py          — FastAPI routes
-  {_BACKEND}/connectors.py   — data sources (mock data, no credentials needed)
-  {_BACKEND}/scoring.py      — pure scoring functions
-  {_FRONTEND}/customer-health-dashboard.html  — list view
-  {_FRONTEND}/customer-detail.html            — detail page
+You are the Product Owner. You work on whatever codebase is at: {APP_DIR}
 
 You have TWO modes:
 
-MODE 1 — PLANNING (when given a goal or no goal)
-  • Inspect the codebase with read_file / bash.
+MODE 1 — PLANNING (when given a goal, or no goal)
+  • Inspect the codebase with read_file and bash (ls, cat, find).
+  • Understand the project type, structure, and how it runs.
   • Choose or refine ONE concrete, deliverable task.
+  • {_start_cmd_hint}
   • Output a spec with:
+      - Project type and how to start it (command + port)
       - What to build (2–3 sentences)
       - Numbered acceptance criteria (testable, specific)
       - Files that will likely change
 
 MODE 2 — JUDGING (when given spec + QA report)
-  • Read the actual changed files to verify claims.
+  • Read the actual changed files to verify the claims.
   • Return ONLY valid JSON — no prose, no markdown fences:
     {{"approved": true, "reasons": ["..."], "next_steps": []}}
     {{"approved": false, "reasons": ["..."], "next_steps": ["fix X", "add Y"]}}
@@ -195,9 +202,9 @@ MODE 2 — JUDGING (when given spec + QA report)
 DEV_SYSTEM = f"""\
 You are the Developer. Implement exactly what the spec says — nothing more.
 
-App root: {APP_DIR}
-Run the backend (for local testing) with:
-  cd {_BACKEND} && /opt/homebrew/bin/python3.11 -m uvicorn app:app --port 8001 &
+Project root: {APP_DIR}
+
+The spec will tell you how to start the app if you need to test locally.
 
 Rules:
   • Always read a file before editing it.
@@ -211,7 +218,7 @@ End your response with a short summary: files changed + why.
 REVIEWER_SYSTEM = f"""\
 You are the Code Reviewer.
 
-App root: {APP_DIR}
+Project root: {APP_DIR}
 
 Read the files that were changed, then review them against the spec.
 Check: correctness, edge cases, consistency with existing code style, security.
@@ -224,17 +231,18 @@ Output:
 QA_SYSTEM = f"""\
 You are the QA Engineer. Test the app end-to-end using curl and shell commands.
 
-App root: {APP_DIR}
+Project root: {APP_DIR}
+
+The spec includes how to start the app. Follow those instructions exactly.
+After starting it, wait 2-3 seconds for it to be ready before testing.
 
 Steps:
-  1. Start the backend if not already running:
-       cd {_BACKEND} && /opt/homebrew/bin/python3.11 -m uvicorn app:app --port 8001 &
-       sleep 2
-  2. Test EVERY acceptance criterion from the spec using curl against http://localhost:8001
-  3. Report each criterion: ✅ PASS or ❌ FAIL — with the actual curl output as evidence.
-  4. Note any unexpected behaviour.
-  5. Kill the test server when done:
-       pkill -f "uvicorn.*8001" 2>/dev/null || true
+  1. Start the app using the command from the spec (background it with &).
+  2. Wait for it to be ready.
+  3. Test EVERY acceptance criterion using curl or shell commands.
+  4. Report each criterion: ✅ PASS or ❌ FAIL — with actual output as evidence.
+  5. Note any unexpected behaviour.
+  6. Kill the test server when done (use pkill or kill on the PID).
 """
 
 
@@ -244,8 +252,11 @@ Steps:
 def run_team(goal: str) -> None:
     banner = f"  GOAL: {goal}" if goal else "  GOAL: (PO will choose)"
     print(f"\n{'#'*64}\n{banner}\n{'#'*64}")
+    print(f"  PROJECT: {APP_DIR}")
+    if START_CMD:
+        print(f"  START:   {START_CMD}")
+    print(f"{'#'*64}")
 
-    # ── Step 1: PO writes the spec ──────────────────────────────────────────
     po_prompt = (
         f"Goal: {goal}\n\nInspect the codebase and produce the spec."
         if goal else
@@ -253,7 +264,6 @@ def run_team(goal: str) -> None:
     )
     spec = run_agent("PRODUCT OWNER — Planning", OPUS, PO_SYSTEM, po_prompt)
 
-    # ── Main loop ───────────────────────────────────────────────────────────
     for iteration in range(1, MAX_ITERS + 1):
         print(f"\n{'─'*64}")
         print(f"  ITERATION {iteration} / {MAX_ITERS}")
@@ -285,7 +295,6 @@ def run_team(goal: str) -> None:
             ),
         )
 
-        # Parse verdict (handle occasional ```json fences)
         try:
             raw = verdict_raw.strip()
             if "```" in raw:
@@ -311,7 +320,6 @@ def run_team(goal: str) -> None:
             print(f"\nQA result :\n{qa_report}")
             return
 
-        # Feed feedback into next iteration
         if iteration < MAX_ITERS:
             spec += (
                 f"\n\n--- Round {iteration} feedback ---\n"
