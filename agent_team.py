@@ -7,18 +7,19 @@ Four-agent loop that works on any codebase.
   └──────────────── repeat until approved or MAX_ITERS ──────┘
 
 Usage:
-    export ANTHROPIC_API_KEY=sk-ant-...
+    export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY=sk-...
     export APP_DIR=/path/to/your/project
+    export PROVIDER=anthropic             # or openai (default: anthropic)
 
-    # Give the team a task:
     /opt/homebrew/bin/python3.11 agent_team.py "Add a /health endpoint"
+    /opt/homebrew/bin/python3.11 agent_team.py        # PO picks the task
 
-    # Let the PO choose what to work on next:
-    /opt/homebrew/bin/python3.11 agent_team.py
-
-    # Tell QA exactly how to start the app (optional — PO will figure it out otherwise):
+    # Optional: tell QA exactly how to start the app
     export START_CMD="npm run dev"
-    /opt/homebrew/bin/python3.11 agent_team.py "Add dark mode toggle"
+
+Models (override via env vars):
+    ANTHROPIC:  PO_MODEL=claude-opus-4-7   AGENT_MODEL=claude-sonnet-4-6
+    OPENAI:     PO_MODEL=o3                AGENT_MODEL=o4-mini
 
 Safety: agents run shell commands scoped to APP_DIR only.
 """
@@ -31,30 +32,28 @@ import subprocess
 import textwrap
 from pathlib import Path
 
-import anthropic
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 APP_DIR   = Path(os.environ.get("APP_DIR", Path(__file__).parent)).resolve()
-START_CMD = os.environ.get("START_CMD", "")   # e.g. "npm run dev", "uvicorn app:app --port 8001"
+START_CMD = os.environ.get("START_CMD", "")
 MAX_ITERS = int(os.environ.get("MAX_ITERS", "3"))
+PROVIDER  = os.environ.get("PROVIDER", "anthropic").lower()
 
-OPUS   = "claude-opus-4-7"
-SONNET = "claude-sonnet-4-6"
-
-client = anthropic.Anthropic()
+if PROVIDER == "openai":
+    PO_MODEL    = os.environ.get("PO_MODEL", "o3")
+    AGENT_MODEL = os.environ.get("AGENT_MODEL", "o4-mini")
+else:
+    PO_MODEL    = os.environ.get("PO_MODEL", "claude-opus-4-7")
+    AGENT_MODEL = os.environ.get("AGENT_MODEL", "claude-sonnet-4-6")
 
 # ---------------------------------------------------------------------------
-# Tools — every agent shares these
+# Tool definitions (Anthropic format — converted for OpenAI on the fly)
 # ---------------------------------------------------------------------------
 TOOLS = [
     {
         "name": "bash",
-        "description": (
-            "Run a shell command inside the project directory. "
-            "Working dir is APP_DIR. Timeout: 60 s."
-        ),
+        "description": "Run a shell command inside the project directory. Working dir is APP_DIR. Timeout: 60 s.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -119,53 +118,153 @@ def _run_tool(name: str, inp: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Provider abstraction
+# Each complete() call returns (text: str, tool_calls: list[dict])
+# where tool_calls = [{"id": ..., "name": ..., "input": {...}}, ...]
+# ---------------------------------------------------------------------------
+
+def _complete_anthropic(model: str, system: str, messages: list[dict]):
+    import anthropic
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=system,
+        tools=TOOLS,
+        messages=messages,
+    )
+    text = "\n".join(b.text for b in response.content if b.type == "text")
+    tool_calls = [
+        {"id": b.id, "name": b.name, "input": b.input}
+        for b in response.content if b.type == "tool_use"
+    ]
+    # Return raw content blocks so we can append them to messages correctly
+    return text, tool_calls, response.content, response.stop_reason
+
+
+def _anthropic_tool_result_message(tool_calls_raw, results: list[str]) -> dict:
+    return {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": tc["id"], "content": res}
+            for tc, res in zip(tool_calls_raw, results)
+        ],
+    }
+
+
+def _complete_openai(model: str, system: str, messages: list[dict]):
+    import openai
+    client = openai.OpenAI()
+
+    # Convert tools to OpenAI format
+    oai_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            },
+        }
+        for t in TOOLS
+    ]
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        tools=oai_tools,
+        tool_choice="auto",
+    )
+
+    msg = response.choices[0].message
+    text = msg.content or ""
+    tool_calls = []
+    if msg.tool_calls:
+        for tc in msg.tool_calls:
+            tool_calls.append({
+                "id": tc.id,
+                "name": tc.function.name,
+                "input": json.loads(tc.function.arguments),
+            })
+
+    stop_reason = response.choices[0].finish_reason
+    return text, tool_calls, msg, stop_reason
+
+
+def _openai_tool_result_message(tool_calls_raw, results: list[str]) -> list[dict]:
+    return [
+        {
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": res,
+        }
+        for tc, res in zip(tool_calls_raw.tool_calls, results)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Generic agent runner
 # ---------------------------------------------------------------------------
 def run_agent(role: str, model: str, system: str, user_message: str) -> str:
-    """Agentic loop: keep calling tools until stop_reason == end_turn."""
-    messages: list[dict] = [{"role": "user", "content": user_message}]
-
     print(f"\n{'='*64}")
-    print(f"  {role}")
+    print(f"  [{PROVIDER.upper()}] {role}  ({model})")
     print(f"{'='*64}")
 
+    if PROVIDER == "openai":
+        messages: list[dict] = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_message},
+        ]
+    else:
+        messages = [{"role": "user", "content": user_message}]
+
     while True:
-        response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=system,
-            tools=TOOLS,
-            messages=messages,
-        )
+        if PROVIDER == "openai":
+            text, tool_calls, raw_msg, stop_reason = _complete_openai(model, system, messages)
+        else:
+            text, tool_calls, raw_content, stop_reason = _complete_anthropic(model, system, messages)
 
-        text_blocks = [b.text for b in response.content if b.type == "text"]
-        tool_uses   = [b      for b in response.content if b.type == "tool_use"]
+        if text:
+            print(textwrap.fill(text, width=76, subsequent_indent="  "))
 
-        for t in text_blocks:
-            print(textwrap.fill(t, width=76, subsequent_indent="  "))
+        # Append assistant turn
+        if PROVIDER == "openai":
+            messages.append(raw_msg)
+        else:
+            messages.append({"role": "assistant", "content": raw_content})
 
-        messages.append({"role": "assistant", "content": response.content})
+        done = (stop_reason in ("end_turn", "stop")) or not tool_calls
+        if done:
+            return text
 
-        if response.stop_reason == "end_turn" or not tool_uses:
-            return "\n".join(text_blocks)
-
-        tool_results = []
-        for tu in tool_uses:
-            args_preview = json.dumps(tu.input)[:100]
-            print(f"\n  [tool] {tu.name}({args_preview})")
-            result = _run_tool(tu.name, tu.input)
+        # Execute tools
+        results = []
+        for tc in tool_calls:
+            print(f"\n  [tool] {tc['name']}({json.dumps(tc['input'])[:100]})")
+            result = _run_tool(tc["name"], tc["input"])
             print(f"  → {result[:400]}")
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tu.id,
-                "content": result,
-            })
+            results.append(result)
 
-        messages.append({"role": "user", "content": tool_results})
+        # Append tool results
+        if PROVIDER == "openai":
+            for tc, res in zip(raw_msg.tool_calls, results):
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": res,
+                })
+        else:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tc["id"], "content": res}
+                    for tc, res in zip(tool_calls, results)
+                ],
+            })
 
 
 # ---------------------------------------------------------------------------
-# Agent system prompts
+# System prompts
 # ---------------------------------------------------------------------------
 _start_cmd_hint = (
     f"The command to start the app for testing is: {START_CMD}"
@@ -252,9 +351,10 @@ Steps:
 def run_team(goal: str) -> None:
     banner = f"  GOAL: {goal}" if goal else "  GOAL: (PO will choose)"
     print(f"\n{'#'*64}\n{banner}\n{'#'*64}")
-    print(f"  PROJECT: {APP_DIR}")
+    print(f"  PROJECT:  {APP_DIR}")
+    print(f"  PROVIDER: {PROVIDER.upper()}  |  PO: {PO_MODEL}  |  Agents: {AGENT_MODEL}")
     if START_CMD:
-        print(f"  START:   {START_CMD}")
+        print(f"  START:    {START_CMD}")
     print(f"{'#'*64}")
 
     po_prompt = (
@@ -262,38 +362,26 @@ def run_team(goal: str) -> None:
         if goal else
         "No explicit goal. Inspect the codebase and choose the highest-value next task. Produce the spec."
     )
-    spec = run_agent("PRODUCT OWNER — Planning", OPUS, PO_SYSTEM, po_prompt)
+    spec = run_agent("PRODUCT OWNER — Planning", PO_MODEL, PO_SYSTEM, po_prompt)
 
     for iteration in range(1, MAX_ITERS + 1):
         print(f"\n{'─'*64}")
         print(f"  ITERATION {iteration} / {MAX_ITERS}")
         print(f"{'─'*64}")
 
-        dev_summary = run_agent(
-            "DEVELOPER", SONNET, DEV_SYSTEM,
-            f"Spec:\n{spec}\n\nImplement it.",
-        )
+        dev_summary = run_agent("DEVELOPER",  AGENT_MODEL, DEV_SYSTEM,
+                                f"Spec:\n{spec}\n\nImplement it.")
 
-        review = run_agent(
-            "REVIEWER", SONNET, REVIEWER_SYSTEM,
-            f"Spec:\n{spec}\n\nDeveloper summary:\n{dev_summary}\n\nReview the actual files.",
-        )
+        review      = run_agent("REVIEWER",   AGENT_MODEL, REVIEWER_SYSTEM,
+                                f"Spec:\n{spec}\n\nDeveloper summary:\n{dev_summary}\n\nReview the actual files.")
 
-        qa_report = run_agent(
-            "QA", SONNET, QA_SYSTEM,
-            f"Spec (acceptance criteria):\n{spec}\n\nRun the tests now.",
-        )
+        qa_report   = run_agent("QA",         AGENT_MODEL, QA_SYSTEM,
+                                f"Spec (acceptance criteria):\n{spec}\n\nRun the tests now.")
 
-        verdict_raw = run_agent(
-            "PRODUCT OWNER — Judging", OPUS, PO_SYSTEM,
-            (
-                f"Spec:\n{spec}\n\n"
-                f"Developer summary:\n{dev_summary}\n\n"
-                f"Code review:\n{review}\n\n"
-                f"QA report:\n{qa_report}\n\n"
-                "Is the work complete? Return only the JSON verdict."
-            ),
-        )
+        verdict_raw = run_agent("PRODUCT OWNER — Judging", PO_MODEL, PO_SYSTEM,
+                                f"Spec:\n{spec}\n\nDeveloper summary:\n{dev_summary}\n\n"
+                                f"Code review:\n{review}\n\nQA report:\n{qa_report}\n\n"
+                                "Is the work complete? Return only the JSON verdict.")
 
         try:
             raw = verdict_raw.strip()
@@ -323,8 +411,7 @@ def run_team(goal: str) -> None:
         if iteration < MAX_ITERS:
             spec += (
                 f"\n\n--- Round {iteration} feedback ---\n"
-                f"Review: {review}\n\n"
-                f"QA: {qa_report}\n\n"
+                f"Review: {review}\n\nQA: {qa_report}\n\n"
                 f"PO next steps: {'; '.join(verdict.get('next_steps', []))}"
             )
             print("\n↩  Cycling back with feedback.\n")
